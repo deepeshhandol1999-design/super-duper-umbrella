@@ -602,59 +602,58 @@ def extract_coordinates_from_text(text):
     
     return coordinates
 
-def calculate_development_length(points):
+def calculate_development_length(points=None, coordinates=None, radii=None, dimensions=None):
     """
     Calculate development length using vector geometry for accurate bend calculations.
-    Handles both straight segments and curved bends.
     
     Args:
-        points: List of coordinate points from the drawing
+        points: List of coordinate points from the drawing (dict format)
+        coordinates: List of (x,y,z) tuples representing path points
+        radii: List of bend radii corresponding to each coordinate point
+        dimensions: Dictionary containing part dimensions including centerline_length
     
     Returns:
         float: Calculated development length in mm
-        float: 0 if calculation fails
     """
     try:
-        if not points or len(points) < 2:
-            return 0
+        # Handle input from points dictionary format
+        if points:
+            coordinates = []
+            radii = []
+            for point in points:
+                try:
+                    x = float(point.get('x', 0))
+                    y = float(point.get('y', 0))
+                    z = float(point.get('z', 0))
+                    r = float(point.get('r', 0)) if point.get('r') is not None else 0
+                    coordinates.append((x, y, z))
+                    radii.append(r)
+                except (ValueError, TypeError) as e:
+                    logging.warning(f"Invalid coordinate data: {e}")
+                    continue
+        
+        # If we have explicit coordinates but no radii, initialize radii list
+        if coordinates and not radii:
+            radii = [0] * len(coordinates)
             
-        coordinates = []
-        radii = []
-        
-        # Convert points to coordinate tuples and extract radii
-        for point in points:
-            try:
-                x = float(point.get('x', 0))
-                y = float(point.get('y', 0))
-                z = float(point.get('z', 0))
-                r = float(point.get('r', 0)) if point.get('r') is not None else 0
-                coordinates.append((x, y, z))
-                radii.append(r)
-            except (ValueError, TypeError) as e:
-                logging.warning(f"Invalid coordinate data: {e}")
-                continue
-        
-        if len(coordinates) < 2:
-            logging.warning("Insufficient valid coordinates for length calculation")
-            return 0
-        
+        # Validate we have sufficient data
+        if not coordinates or len(coordinates) < 2:
+            # Try to get centerline length from dimensions
+            if dimensions:
+                centerline = dimensions.get("centerline_length", "Not Found")
+                if centerline != "Not Found" and str(centerline).replace('.', '', 1).replace('-', '', 1).isdigit():
+                    return round(float(centerline), 2)
+            logging.warning("Insufficient coordinates for length calculation")
+            return round(2 * math.pi * 40 * (90 / 360), 2)  # 40mm radius, 90° angle default
+            
         # Calculate total length using path length helper
         total_length = calculate_path_length(coordinates, radii)
         logging.info(f"Calculated development length: {total_length:.2f}mm")
-        
         return round(total_length, 2)
             
     except Exception as e:
         logging.error(f"Error calculating development length: {e}")
-        return 0
-        centerline = dimensions.get("centerline_length", "Not Found")
-        if centerline != "Not Found" and str(centerline).replace('.', '', 1).replace('-', '', 1).isdigit():
-            return round(float(centerline), 2)
-        
-        # Use default values if all else fails
-        return round(2 * math.pi * 40 * (90 / 360), 2)  # 40mm radius, 90° angle default
-
-def calculate_development_length(coordinates=None, radii=None, dimensions=None):
+        return round(2 * math.pi * 40 * (90 / 360), 2)  # Default fallback
     """
     Calculate the total development length of a part considering bends and straight sections.
     
@@ -1186,11 +1185,26 @@ def clean_text_encoding(text):
 
 # --- Function to convert PDF to images ---
 def convert_pdf_to_images(pdf_content):
-    """Convert PDF bytes to list of PIL images with error handling and optimized memory usage."""
+    """
+    Convert PDF content to list of PIL images with error handling and optimized memory usage.
+    Handles both bytes and BytesIO input.
+    """
     try:
+        # Convert bytes to BytesIO if needed
+        if isinstance(pdf_content, bytes):
+            pdf_content = io.BytesIO(pdf_content)
+        elif not isinstance(pdf_content, io.BytesIO):
+            raise ValueError("pdf_content must be bytes or BytesIO")
+            
+        # Ensure we're at the start of the buffer
+        pdf_content.seek(0)
+        
         # Lower DPI to reduce memory usage while maintaining readable quality
-        images = convert_from_bytes(pdf_content, dpi=150, fmt='png')
+        images = convert_from_bytes(pdf_content.read(), dpi=150, fmt='png')
         logger.info(f"Converted PDF to {len(images)} images at 150 DPI")
+        
+        # Reset buffer position for potential reuse
+        pdf_content.seek(0)
         return images
     except Exception as e:
         logger.error(f"PDF to image conversion failed: {str(e)}")
@@ -1747,35 +1761,20 @@ def upload_and_analyze():
     final_results = {}
     logging.info(f"New analysis request for file: {file.filename}")
     
-    # Read and analyze PDF
+    # Read and analyze PDF once
     try:
-        pdf_bytes = file.read()
-        full_text = extract_text_from_pdf(pdf_bytes)
+        pdf_bytes = file.read()  # Read bytes only once
+        
+        # Store bytes in memory buffer for reuse if needed
+        pdf_buffer = io.BytesIO(pdf_bytes)
+        
+        # Extract text from PDF
+        full_text = extract_text_from_pdf(pdf_buffer)
         if not full_text:
             return jsonify({"error": "Failed to extract text from PDF"}), 500
-    except Exception as e:
-        logging.error(f"Error reading PDF: {str(e)}")
-        return jsonify({"error": f"PDF reading failed: {str(e)}"}), 500
-
-    # Parse text with Gemini
-    try:
-        final_results = parse_text_with_gemini(full_text)
-        if not isinstance(final_results, dict):
-            return jsonify({"error": "Invalid response format from text parser"}), 500
-        if "error" in final_results:
-            return jsonify(final_results), 500
-    except Exception as e:
-        logging.error(f"Error parsing with Gemini: {str(e)}")
-        return jsonify({"error": f"Text parsing failed: {str(e)}"}), 500
-
-    logging.info(f"New analysis request for file: {file.filename}")
-    
-    # Read and analyze PDF
-    try:
-        pdf_bytes = file.read()
-        full_text = extract_text_from_pdf(pdf_bytes)
-        if not full_text:
-            return jsonify({"error": "Failed to extract text from PDF"}), 500
+            
+        # Reset buffer position for potential reuse
+        pdf_buffer.seek(0)
     except Exception as e:
         logging.error(f"Error reading PDF: {str(e)}")
         return jsonify({"error": f"PDF reading failed: {str(e)}"}), 500
