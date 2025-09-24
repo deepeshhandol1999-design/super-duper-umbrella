@@ -43,6 +43,47 @@ try:
 except Exception as e:
     logging.error(f"Failed to configure Gemini API key: {e}")
 
+# --- SAE J20 Table 6B Burst Pressure Data for 20R4 Radiator Hoses (ID in mm, Min Burst in MPa) ---
+# Hardcoded from reliable sources (e.g., Dayco burst pressure ratings PDF)
+burst_table = [
+    (9.525, 1.241),
+    (12.7, 1.173),
+    (15.875, 1.103),
+    (19.05, 1.034),
+    (22.225, 0.966),
+    (25.4, 0.966),
+    (28.575, 0.897),
+    (31.75, 0.897),
+    (34.925, 0.828),
+    (38.1, 0.828),
+    (41.275, 0.758),
+    (44.45, 0.758),
+    (50.8, 0.689),
+    (57.15, 0.621),
+    (60.325, 0.552),
+    (63.5, 0.552),
+    (69.85, 0.483),
+    (76.2, 0.415),
+    (82.55, 0.345),
+    (88.9, 0.276),
+    (101.6, 0.276),
+]
+
+# --- Function to Interpolate Min Burst Pressure from Table (in bar) ---
+def get_min_burst_bar(id_mm):
+    if id_mm <= burst_table[0][0]:
+        return burst_table[0][1] * 10  # Convert MPa to bar
+    if id_mm >= burst_table[-1][0]:
+        return burst_table[-1][1] * 10
+    for i in range(len(burst_table) - 1):
+        low_id, low_burst = burst_table[i]
+        high_id, high_burst = burst_table[i + 1]
+        if low_id <= id_mm <= high_id:
+            fraction = (id_mm - low_id) / (high_id - low_id)
+            mpa = low_burst + fraction * (high_burst - low_burst)
+            return round(mpa * 10, 1)  # To bar, 1 decimal
+    return "Not Found"
+
 # --- Load and Clean Material Database on Startup with Enhanced Debugging ---
 try:
     # Read from Excel file directly, specifying Sheet1
@@ -1699,6 +1740,115 @@ def upload_and_analyze():
     file = request.files['file']
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
+    
+    if not file.filename.lower().endswith('.pdf'):
+        return jsonify({"error": "Invalid file type. Please upload a PDF."}), 400
+        
+    final_results = {}
+    logging.info(f"New analysis request for file: {file.filename}")
+    
+    # Read and analyze PDF
+    try:
+        pdf_bytes = file.read()
+        full_text = extract_text_from_pdf(pdf_bytes)
+        if not full_text:
+            return jsonify({"error": "Failed to extract text from PDF"}), 500
+    except Exception as e:
+        logging.error(f"Error reading PDF: {str(e)}")
+        return jsonify({"error": f"PDF reading failed: {str(e)}"}), 500
+
+    # Parse text with Gemini
+    try:
+        final_results = parse_text_with_gemini(full_text)
+        if not isinstance(final_results, dict):
+            return jsonify({"error": "Invalid response format from text parser"}), 500
+        if "error" in final_results:
+            return jsonify(final_results), 500
+    except Exception as e:
+        logging.error(f"Error parsing with Gemini: {str(e)}")
+        return jsonify({"error": f"Text parsing failed: {str(e)}"}), 500
+
+    logging.info(f"New analysis request for file: {file.filename}")
+    
+    # Read and analyze PDF
+    try:
+        pdf_bytes = file.read()
+        full_text = extract_text_from_pdf(pdf_bytes)
+        if not full_text:
+            return jsonify({"error": "Failed to extract text from PDF"}), 500
+    except Exception as e:
+        logging.error(f"Error reading PDF: {str(e)}")
+        return jsonify({"error": f"PDF reading failed: {str(e)}"}), 500
+
+    # Parse text with Gemini
+    try:
+        final_results = parse_text_with_gemini(full_text)
+        if not isinstance(final_results, dict):
+            return jsonify({"error": "Invalid response format from text parser"}), 500
+        if "error" in final_results:
+            return jsonify(final_results), 500
+    except Exception as e:
+        logging.error(f"Error parsing with Gemini: {str(e)}")
+        return jsonify({"error": f"Text parsing failed: {str(e)}"}), 500
+
+    # Extract dimensions
+    try:
+        dimensions = extract_dimensions_from_text(full_text)
+        final_results.update(dimensions)  # Merge with Gemini results
+    except Exception as e:
+        logging.error(f"Error extracting dimensions: {str(e)}")
+        return jsonify({"error": f"Dimension extraction failed: {str(e)}"}), 500
+
+    # Look up material based on standard and grade
+    try:
+        standard = final_results.get("standard", "Not Found")
+        grade = final_results.get("grade", "Not Found")
+        final_results["material"] = get_material_from_standard(standard, grade)
+    except Exception as e:
+        logging.error(f"Error in material lookup: {e}")
+        final_results["material"] = "Not Found"        # New: Infer missing values for MPAPS F-30 Grade 1B
+        if standard == "MPAPS F-30" and grade == "1B":
+            # Infer thickness if not found
+            if final_results.get("thickness", "Not Found") == "Not Found":
+                final_results["thickness"] = "5"
+            
+            # Infer reinforcement if not found
+            if final_results.get("reinforcement", "Not Found") == "Not Found":
+                final_results["reinforcement"] = "Fabric reinforced"
+            
+            # Infer ODs if not found (using thickness)
+            thickness = float(final_results.get("thickness", 0))
+            if thickness > 0:
+                if final_results.get("od1", "Not Found") == "Not Found" and final_results.get("id1", "Not Found") != "Not Found":
+                    id1 = float(final_results["id1"])
+                    final_results["od1"] = str(id1 + 2 * thickness)
+                if final_results.get("od2", "Not Found") == "Not Found" and final_results.get("id2", "Not Found") != "Not Found":
+                    id2 = float(final_results["id2"])
+                    final_results["od2"] = str(id2 + 2 * thickness)
+            
+            # Infer burst pressure if not found (using smallest ID)
+            ids = []
+            for key in ["id1", "id2"]:
+                if final_results.get(key, "Not Found") != "Not Found":
+                    try:
+                        ids.append(float(final_results[key]))
+                    except ValueError:
+                        pass
+            if ids and final_results.get("burst_pressure", "Not Found") == "Not Found":
+                min_id = min(ids)
+                burst_bar = get_min_burst_bar(min_id)
+                if burst_bar != "Not Found":
+                    final_results["burst_pressure"] = str(burst_bar)
+            
+            # Infer volume (material volume in mm³) if calculable
+            if final_results.get("volume", "Not Found") == "Not Found":
+                if ids and final_results.get("centerline_length", "Not Found") != "Not Found" and thickness > 0:
+                    avg_id = sum(ids) / len(ids)
+                    inner_radius = avg_id / 2
+                    outer_radius = inner_radius + thickness
+                    length_mm = float(final_results["centerline_length"])
+                    volume_mm3 = math.pi * (outer_radius**2 - inner_radius**2) * length_mm
+                    final_results["volume"] = str(round(volume_mm3))
     
     if not file.filename.lower().endswith('.pdf'):
         return jsonify({"error": "Invalid file type. Please upload a PDF."}), 400
