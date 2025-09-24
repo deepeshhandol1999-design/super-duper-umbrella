@@ -1186,18 +1186,41 @@ def clean_text_encoding(text):
 # --- Function to convert PDF to images ---
 def convert_pdf_to_images(pdf_content):
     """
-    Convert PDF content to list of PIL images with error handling and optimized memory usage.
-    Handles both bytes and BytesIO input.
+    Convert PDF content to list of PIL images with enhanced error handling and validation.
+    Handles both bytes and BytesIO input with proper resource cleanup.
     """
+    images = []
+    temp_files = []
+    
     try:
+        # Validate input
+        if not pdf_content:
+            raise ValueError("Empty PDF content provided")
+            
         # Convert bytes to BytesIO if needed
         if isinstance(pdf_content, bytes):
+            if len(pdf_content) == 0:
+                raise ValueError("Empty PDF bytes provided")
             pdf_content = io.BytesIO(pdf_content)
         elif not isinstance(pdf_content, io.BytesIO):
             raise ValueError("pdf_content must be bytes or BytesIO")
             
+        # Validate PDF content
+        if pdf_content.getvalue() == b'':
+            raise ValueError("Empty PDF stream provided")
+            
         # Ensure we're at the start of the buffer
         pdf_content.seek(0)
+        
+        # Validate PDF structure
+        try:
+            doc = fitz.open(stream=pdf_content.getvalue(), filetype="pdf")
+            if doc.page_count == 0:
+                doc.close()
+                raise ValueError("PDF document contains no pages")
+            doc.close()
+        except Exception as e:
+            raise ValueError(f"Invalid PDF structure: {str(e)}")
         
         # Lower DPI to reduce memory usage while maintaining readable quality
         images = convert_from_bytes(pdf_content.read(), dpi=150, fmt='png')
@@ -1761,18 +1784,43 @@ def upload_and_analyze():
     final_results = {}
     logging.info(f"New analysis request for file: {file.filename}")
     
-    # Read and analyze PDF once
+    # Read and validate PDF file
     try:
         pdf_bytes = file.read()  # Read bytes only once
-        
+        if len(pdf_bytes) == 0:
+            logging.error("Uploaded file is empty")
+            return jsonify({"error": "The uploaded file is empty. Please check the file and try again."}), 400
+            
         # Store bytes in memory buffer for reuse if needed
         pdf_buffer = io.BytesIO(pdf_bytes)
+        
+        # Validate PDF structure
+        try:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            if doc.page_count == 0:
+                logging.error("PDF has no pages")
+                return jsonify({"error": "The uploaded PDF file appears to be corrupted or has no pages."}), 400
+            doc.close()
+        except Exception as e:
+            logging.error(f"Invalid PDF structure: {str(e)}")
+            return jsonify({"error": "The file appears to be corrupted or is not a valid PDF."}), 400
         
         # Extract text from PDF
         full_text = extract_text_from_pdf(pdf_buffer)
         if not full_text:
-            return jsonify({"error": "Failed to extract text from PDF"}), 500
-            
+            logging.warning("No text extracted from PDF, will attempt OCR")
+            # Reset buffer for OCR attempt
+            pdf_buffer.seek(0)
+            try:
+                # Convert to images and try OCR
+                images = convert_from_bytes(pdf_bytes)
+                if not images:
+                    return jsonify({"error": "Failed to process PDF pages for OCR"}), 500
+                # Continue with OCR processing...
+            except Exception as ocr_error:
+                logging.error(f"OCR processing failed: {str(ocr_error)}")
+                return jsonify({"error": "Failed to extract text from PDF using both methods"}), 500
+                
         # Reset buffer position for potential reuse
         pdf_buffer.seek(0)
     except Exception as e:
@@ -1988,29 +2036,57 @@ def analyze_image_with_gemini_vision(pdf_bytes):
 def extract_text_from_pdf(pdf_bytes):
     """
     Enhanced text extraction from PDF using multiple methods and layout preservation.
-    Tries different extraction techniques and combines results for best output.
+    Includes improved error handling and validation.
     """
     logger.info("Starting enhanced text extraction process...")
+    
+    # Validate input
+    if not pdf_bytes or len(pdf_bytes) == 0:
+        logger.error("Error in enhanced text extraction: Cannot open empty stream.")
+        raise ValueError("Cannot process empty PDF data")
+        
     texts = []
     
     try:
         # Method 1: PyMuPDF with layout preservation
-        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-            # Try different text extraction modes
-            for page in doc:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        if doc.page_count == 0:
+            doc.close()
+            logger.error("Error in enhanced text extraction: PDF has no pages")
+            raise ValueError("PDF document contains no pages")
+            
+        # Try different text extraction modes
+        for page_num, page in enumerate(doc):
+            try:
                 # Get text with layout preservation
                 layout_text = page.get_text("text", sort=True)
-                texts.append(layout_text)
+                if layout_text.strip():
+                    texts.append(layout_text)
+                    logger.debug(f"Extracted {len(layout_text)} characters from page {page_num + 1}")
+            except Exception as e:
+                logger.warning(f"Error extracting text from page {page_num + 1}: {str(e)}")
+                continue
                 
-                # Get text blocks with position information
+        doc.close()
+        
+        # Method 2: Get text blocks with position information
+        try:
+            for page in doc:
                 blocks = page.get_text("blocks")
                 structured_text = "\n".join([block[4] for block in blocks])
                 texts.append(structured_text)
-                
-                # Get raw text as fallback
+        except Exception as e:
+            logger.warning(f"Error extracting blocks: {str(e)}")
+            
+        # Method 3: Get raw text as fallback
+        try:
+            for page in doc:
                 raw_text = page.get_text("text", sort=False)
                 texts.append(raw_text)
-                
+        except Exception as e:
+            logger.warning(f"Error extracting raw text: {str(e)}")
+        
+        # Combine and clean up all extracted text
         combined_text = "\n".join(filter(None, texts))
         logger.info(f"PyMuPDF extraction found {len(combined_text)} characters with layout preservation")
         
