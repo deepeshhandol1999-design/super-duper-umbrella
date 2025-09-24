@@ -342,7 +342,8 @@ def extract_dimensions_from_text(text):
         "thickness": "Not Found",
         "centerline_length": "Not Found",
         "radius": "Not Found",
-        "angle": "Not Found"
+        "angle": "Not Found",
+        "weight": "Not Found"   # Added weight field
     }
 
     try:
@@ -402,6 +403,9 @@ def extract_dimensions_from_text(text):
             'angle': [
                 r'(\d+[.,]?\d*)\s*(?:°|DEG\.?|DEGREES?)',
                 r'(?:ANGLE|ANG\.?)\s*(?:=|:|IS|:=)?\s*(\d+[.,]?\d*)\s*(?:°|DEG\.?|DEGREES?)?'
+            ],
+            'weight': [
+                r'WEIGHT\s*=?\s*(\d+\.?\d*)\s*KG'
             ]
         }
         
@@ -446,6 +450,8 @@ def extract_dimensions_from_text(text):
                         dimensions['od2'] = format_value(values[-1])
                     elif dim_type == 'thickness':
                         dimensions['thickness'] = format_value(values[0])
+                    elif dim_type == 'weight':
+                        dimensions['weight'] = format_value(values[0])
                     elif dim_type == 'centerline':
                         dimensions['centerline_length'] = format_value(values[0])
                     elif dim_type == 'radius':
@@ -863,6 +869,11 @@ def generate_excel_sheet(analysis_results, dimensions, development_length):
                     thickness_calculated = f"{((od_val - id_val) / 2):.2f}"
         except (ValueError, TypeError) as e:
             logging.warning(f"Error calculating thickness: {e}")
+            
+        # Handle missing thickness
+        if thickness_calculated == "Not Found" and dimensions.get("thickness") == "Not Found":
+            dimensions["thickness"] = "Per MPAPS F-30"
+            thickness_calculated = "Per MPAPS F-30"
 
         # Calculate burst pressure if working pressure is available
         burst_pressure_calc = "Not Found"
@@ -909,13 +920,13 @@ def generate_excel_sheet(analysis_results, dimensions, development_length):
         if standard.startswith('MPAPS F 1'):
             remarks.append('Drawing specifies MPAPS F 1, considered as MPAPS F 30.')
 
-        # Check for ID mismatch
+        # Check for ID mismatch (only if both found)
         id1 = dimensions.get('id1', 'Not Found')
         id2 = dimensions.get('id2', 'Not Found')
         if id1 != 'Not Found' and id2 != 'Not Found' and id1 != id2:
             remarks.append('THERE IS MISMATCH IN ID 1 & ID 2')
 
-        # Check for OD mismatch
+        # Check for OD mismatch (only if both found)
         od1 = dimensions.get('od1', 'Not Found')
         od2 = dimensions.get('od2', 'Not Found')
         if od1 != 'Not Found' and od2 != 'Not Found' and od1 != od2:
