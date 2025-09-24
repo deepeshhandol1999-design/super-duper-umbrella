@@ -1194,16 +1194,24 @@ def convert_pdf_to_images(pdf_content):
     
     try:
         # Validate input
-        if not pdf_content:
-            raise ValueError("Empty PDF content provided")
+        if pdf_content is None:
+            logger.error("Error in PDF to image conversion: No PDF data provided")
+            raise ValueError("No PDF data provided")
             
-        # Convert bytes to BytesIO if needed
-        if isinstance(pdf_content, bytes):
+        # Handle both bytes and BytesIO objects
+        if isinstance(pdf_content, io.BytesIO):
+            if len(pdf_content.getvalue()) == 0:
+                logger.error("Error in PDF to image conversion: Empty BytesIO stream")
+                raise ValueError("Empty PDF stream")
+            pdf_data = pdf_content
+        else:
+            if not isinstance(pdf_content, bytes):
+                logger.error("Error in PDF to image conversion: Input must be bytes or BytesIO")
+                raise ValueError("Input must be bytes or BytesIO")
             if len(pdf_content) == 0:
-                raise ValueError("Empty PDF bytes provided")
-            pdf_content = io.BytesIO(pdf_content)
-        elif not isinstance(pdf_content, io.BytesIO):
-            raise ValueError("pdf_content must be bytes or BytesIO")
+                logger.error("Error in PDF to image conversion: Empty bytes")
+                raise ValueError("Empty PDF bytes")
+            pdf_data = io.BytesIO(pdf_content)
             
         # Validate PDF content
         if pdf_content.getvalue() == b'':
@@ -2041,15 +2049,30 @@ def extract_text_from_pdf(pdf_bytes):
     logger.info("Starting enhanced text extraction process...")
     
     # Validate input
-    if not pdf_bytes or len(pdf_bytes) == 0:
-        logger.error("Error in enhanced text extraction: Cannot open empty stream.")
-        raise ValueError("Cannot process empty PDF data")
+    if pdf_bytes is None:
+        logger.error("Error in enhanced text extraction: No PDF data provided")
+        raise ValueError("No PDF data provided")
+        
+    # Handle both bytes and BytesIO objects
+    if isinstance(pdf_bytes, io.BytesIO):
+        if len(pdf_bytes.getvalue()) == 0:
+            logger.error("Error in enhanced text extraction: Empty BytesIO stream")
+            raise ValueError("Empty PDF stream")
+        pdf_content = pdf_bytes
+    else:
+        if not isinstance(pdf_bytes, bytes):
+            logger.error("Error in enhanced text extraction: Input must be bytes or BytesIO")
+            raise ValueError("Input must be bytes or BytesIO")
+        if len(pdf_bytes) == 0:
+            logger.error("Error in enhanced text extraction: Empty bytes")
+            raise ValueError("Empty PDF bytes")
+        pdf_content = io.BytesIO(pdf_bytes)
         
     texts = []
     
     try:
         # Method 1: PyMuPDF with layout preservation
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        doc = fitz.open(stream=pdf_content.getvalue(), filetype="pdf")
         if doc.page_count == 0:
             doc.close()
             logger.error("Error in enhanced text extraction: PDF has no pages")
