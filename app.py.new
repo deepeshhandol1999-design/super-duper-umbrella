@@ -1,0 +1,460 @@
+import os
+import re
+import math
+import base64
+import pandas as pd
+import io
+import gc
+import json
+import logging
+import tempfile
+import numpy as np
+import unicodedata
+import openpyxl
+from PIL import Image, ImageFilter
+
+try:
+    import cv2
+    HAS_OPENCV = True
+except Exception as e:
+    cv2 = None
+    HAS_OPENCV = False
+    logging.warning(f"OpenCV (cv2) not available: {e}")
+    
+import pytesseract
+from flask import Flask, request, jsonify, render_template, send_file
+from flask_cors import CORS
+import fitz  # PyMuPDF
+from pdf2image import convert_from_path, convert_from_bytes
+from PIL import Image
+import google.generativeai as genai
+
+# --- Basic Configuration ---
+app = Flask(__name__)
+CORS(app)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- API Key Configuration ---
+try:
+    genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+    logging.info("Gemini API key configured successfully.")
+except Exception as e:
+    logging.error(f"Failed to configure Gemini API key: {e}")
+
+# --- SAE J20 Table 6B Burst Pressure Data ---
+burst_table = [
+    (9.525, 1.241), (12.7, 1.173), (15.875, 1.103), (19.05, 1.034),
+    (22.225, 0.966), (25.4, 0.966), (28.575, 0.897), (31.75, 0.897),
+    (34.925, 0.828), (38.1, 0.828), (41.275, 0.758), (44.45, 0.758),
+    (50.8, 0.689), (57.15, 0.621), (60.325, 0.552), (63.5, 0.552),
+    (69.85, 0.483), (76.2, 0.415), (82.55, 0.345), (88.9, 0.276), (101.6, 0.276)
+]
+
+def get_min_burst_bar(id_mm):
+    """Interpolate min burst pressure from table (in bar)"""
+    if id_mm <= burst_table[0][0]:
+        return burst_table[0][1] * 10
+    if id_mm >= burst_table[-1][0]:
+        return burst_table[-1][1] * 10
+    for i in range(len(burst_table) - 1):
+        low_id, low_burst = burst_table[i]
+        high_id, high_burst = burst_table[i + 1]
+        if low_id <= id_mm <= high_id:
+            fraction = (id_mm - low_id) / (high_id - low_id)
+            mpa = low_burst + fraction * (high_burst - low_burst)
+            return round(mpa * 10, 1)
+    return "Not Found"
+
+# --- Load Material Database ---
+try:
+    material_df = pd.read_excel("MATERIAL WITH STANDARD.xlsx", sheet_name="Sheet1")
+    material_df['STANDARD'] = material_df['STANDARD'].str.strip()
+    material_df['GRADE'] = material_df['GRADE'].astype(str).str.strip()
+    logging.info(f"Material database loaded with {len(material_df)} entries.")
+except FileNotFoundError:
+    logging.error("MATERIAL WITH STANDARD.xlsx not found.")
+    material_df = None
+
+def normalize_for_comparison(text):
+    """Normalize text for reliable comparison"""
+    if not text:
+        return ""
+    
+    text = str(text).upper()
+    
+    # Common OCR corrections
+    ocr_fixes = {
+        'ВТРАР': 'STRAIGHT', 'АК': 'AK', 'ОЛГЮЛЕ': 'ANGLE', 'ГРАД': 'GRADE',
+        'ТУПЕ': 'TYPE', 'О': 'O', 'В': 'B', '1В': '1B', 'IВ': '1B'
+    }
+    for wrong, correct in ocr_fixes.items():
+        text = text.replace(wrong, correct)
+    
+    # Normalize specification format
+    text = re.sub(r'MPAPS\s*[-_]?\s*F\s*[-_]?\s*(\d+)', r'MPAPSF\1', text)
+    text = re.sub(r'F-?(\d+)', r'F\1', text)
+    
+    # Remove whitespace and special chars
+    text = ''.join(text.split())
+    text = re.sub(r'[^A-Z0-9\.]', '', text)
+    
+    return text
+
+def get_material_from_standard(standard, grade):
+    """Enhanced material lookup"""
+    if material_df is None:
+        return "Not Found"
+    
+    if standard == "Not Found" or grade == "Not Found":
+        return "Not Found"
+    
+    try:
+        norm_standard = normalize_for_comparison(standard)
+        norm_grade = normalize_for_comparison(grade)
+        
+        # Exact match
+        exact_matches = material_df[
+            (material_df['STANDARD'].apply(normalize_for_comparison) == norm_standard) &
+            (material_df['GRADE'].apply(normalize_for_comparison) == norm_grade)
+        ]
+        
+        if not exact_matches.empty:
+            return exact_matches.iloc[0]['MATERIAL']
+        
+        return "Not Found"
+    
+    except Exception as e:
+        logging.error(f"Error in material lookup: {e}")
+        return "Not Found"
+
+def clean_text_encoding(text):
+    """Clean and normalize text"""
+    if not text:
+        return ""
+    
+    try:
+        # Common replacements
+        replacements = {
+            'ВТРАР': 'STRAIGHT', 'АК': 'AK', 'ОЛГЮЛЕ': 'ANGLE', 'ГРАД': 'GRADE',
+            '1В': '1B', 'IВ': '1B', 'MPAPS F30': 'MPAPS F-30', 'MPAPS F 30': 'MPAPS F-30'
+        }
+        
+        for wrong, correct in replacements.items():
+            text = text.replace(wrong, correct)
+        
+        # Basic cleanup
+        text = ''.join(char if char.isprintable() or char in '\n\t' else ' ' for char in text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        return text
+    except Exception as e:
+        logging.error(f"Error cleaning text: {e}")
+        return text
+
+def extract_dimensions_from_text(text):
+    """Extract dimensions from text using regex patterns"""
+    dimensions = {
+        "id1": "Not Found", "id2": "Not Found", "od1": "Not Found", "od2": "Not Found",
+        "thickness": "Not Found", "centerline_length": "Not Found", 
+        "radius": "Not Found", "angle": "Not Found", "weight": "Not Found"
+    }
+
+    try:
+        text = clean_text_encoding(text)
+        
+        # Patterns for dimension extraction
+        patterns = {
+            'id': [
+                r'INSIDE\s*Ø\s*(\d+(?:\.\d+)?)',
+                r'ID\s*Ø\s*(\d+(?:\.\d+)?)',
+                r'HOSE\s*ID\s*[=:]?\s*(\d+(?:\.\d+)?)',
+                r'INSIDE\s*DIAMETER\s*[=:]?\s*(\d+(?:\.\d+)?)'
+            ],
+            'centerline': [
+                r'APPROX\s*CTRLINE\s*LENGTH\s*[=:]?\s*(\d+(?:\.\d+)?)',
+                r'CENTERLINE\s*LENGTH\s*[=:]?\s*(\d+(?:\.\d+)?)'
+            ],
+            'weight': [
+                r'WEIGHT\s*[=:]?\s*(\d+\.?\d*)\s*KG'
+            ]
+        }
+        
+        # Extract using patterns
+        for dim_type, pattern_list in patterns.items():
+            for pattern in pattern_list:
+                matches = re.finditer(pattern, text, re.IGNORECASE)
+                values = []
+                for match in matches:
+                    try:
+                        value = match.group(1).replace(',', '.')
+                        if value.replace('.', '', 1).isdigit():
+                            values.append(float(value))
+                    except (ValueError, AttributeError):
+                        continue
+                
+                if values:
+                    if dim_type == 'id':
+                        dimensions['id1'] = f"{values[0]:.1f}"
+                    elif dim_type == 'centerline':
+                        dimensions['centerline_length'] = f"{values[0]:.1f}"
+                    elif dim_type == 'weight':
+                        dimensions['weight'] = f"{values[0]:.2f}"
+        
+        return dimensions
+        
+    except Exception as e:
+        logging.error(f"Error extracting dimensions: {e}")
+        return dimensions
+
+def extract_coordinates_from_text(text):
+    """Extract coordinates from text"""
+    coordinates = []
+    
+    try:
+        text = clean_text_encoding(text)
+        
+        # Pattern for coordinate table
+        pattern = r'P(\d+)\s+(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s*(\d+\.?\d*)?'
+        matches = re.finditer(pattern, text)
+        
+        for match in matches:
+            point = {
+                'point': f'P{match.group(1)}',
+                'x': float(match.group(2)),
+                'y': float(match.group(3)),
+                'z': float(match.group(4))
+            }
+            if match.group(5):
+                point['r'] = float(match.group(5))
+            coordinates.append(point)
+        
+        coordinates.sort(key=lambda p: int(p['point'][1:]))
+        return coordinates
+        
+    except Exception as e:
+        logging.error(f"Error extracting coordinates: {e}")
+        return []
+
+def calculate_path_length(points, radii):
+    """Calculate total path length considering bends"""
+    n = len(points)
+    if n < 2:
+        return 0
+    
+    total_length = 0
+    
+    for i in range(n-1):
+        # Straight segment length
+        straight_length = math.dist(points[i], points[i+1])
+        total_length += straight_length
+        
+        # Bend adjustment for interior points
+        if i > 0 and i < n-1 and radii[i] and radii[i] > 0:
+            try:
+                # Vectors for incoming and outgoing segments
+                v1 = [b-a for a, b in zip(points[i-1], points[i])]
+                v2 = [b-a for a, b in zip(points[i], points[i+1])]
+                
+                mag1 = math.sqrt(sum(x*x for x in v1))
+                mag2 = math.sqrt(sum(x*x for x in v2))
+                
+                if mag1 == 0 or mag2 == 0:
+                    continue
+                    
+                dot_product = sum(a*b for a,b in zip(v1, v2))
+                cos_theta = max(min(dot_product / (mag1 * mag2), 1.0), -1.0)
+                theta = math.acos(cos_theta)
+                
+                if theta == 0:
+                    continue
+                
+                R = radii[i]
+                tangent_length = R * math.tan(theta / 2)
+                arc_length = R * theta
+                
+                total_length -= 2 * tangent_length
+                total_length += arc_length
+                
+            except Exception as e:
+                logging.warning(f"Error processing bend: {e}")
+                continue
+    
+    return round(total_length, 2)
+
+def calculate_development_length(coordinates):
+    """Calculate development length from coordinates"""
+    try:
+        if not coordinates or len(coordinates) < 2:
+            return 0
+            
+        points = []
+        radii = []
+        
+        for point in coordinates:
+            try:
+                x = point.get('x', 0)
+                y = point.get('y', 0)
+                z = point.get('z', 0)
+                r = point.get('r', 0)
+                points.append((x, y, z))
+                radii.append(r)
+            except (ValueError, TypeError):
+                continue
+        
+        if len(points) < 2:
+            return 0
+            
+        return calculate_path_length(points, radii)
+            
+    except Exception as e:
+        logging.error(f"Error calculating development length: {e}")
+        return 0
+
+def parse_text_with_gemini(full_text):
+    """Parse text using Gemini AI"""
+    logging.info("Starting data parsing with Gemini...")
+    model = genai.GenerativeModel('gemini-1.5-flash-latest')
+    
+    prompt = f"""
+    Analyze the following engineering drawing text and extract key information as JSON.
+    
+    Text to analyze:
+    ---
+    {full_text}
+    ---
+    
+    Extract these fields:
+    - "part_number": Look for 7-digit numbers like 6734500C2
+    - "description": Main part description
+    - "standard": Specification like MPAPS F-30
+    - "grade": Grade like 1B
+    - "id": Inside diameter
+    - "thickness": Wall thickness  
+    - "centerline_length": Centerline length
+    - "coordinates": Array of points with x,y,z coordinates
+    
+    Return ONLY valid JSON. Use "Not Found" for missing values.
+    """
+    
+    try:
+        response = model.generate_content(prompt)
+        cleaned_text = response.text.strip().replace("```json", "").replace("```", "").strip()
+        parsed_data = json.loads(cleaned_text)
+        logging.info("Successfully parsed Gemini response")
+        return parsed_data
+    except Exception as e:
+        logging.error(f"Failed to parse with Gemini: {e}")
+        return {
+            "part_number": "Not Found", "description": "Not Found", "standard": "Not Found",
+            "grade": "Not Found", "id": "Not Found", "thickness": "Not Found",
+            "centerline_length": "Not Found", "coordinates": []
+        }
+
+def extract_text_from_pdf(pdf_bytes):
+    """Extract text from PDF with multiple methods"""
+    logger.info("Starting enhanced text extraction...")
+    
+    try:
+        # Method 1: PyMuPDF
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            text = ""
+            for page in doc:
+                text += page.get_text("text", sort=True) + "\n"
+        
+        if len(text.strip()) > 100:
+            logger.info(f"PyMuPDF extracted {len(text)} characters")
+            return text
+        
+        # Method 2: OCR fallback
+        logger.info("Falling back to OCR...")
+        images = convert_from_bytes(pdf_bytes, dpi=150)
+        ocr_text = ""
+        for img in images:
+            ocr_text += pytesseract.image_to_string(img) + "\n"
+        
+        return ocr_text if ocr_text.strip() else text
+        
+    except Exception as e:
+        logger.error(f"Error in text extraction: {e}")
+        return ""
+
+# --- API endpoint ---
+@app.route('/api/analyze', methods=['POST'])
+def upload_and_analyze():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+        
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+        
+    if not file.filename.lower().endswith('.pdf'):
+        return jsonify({"error": "Please upload a PDF file"}), 400
+
+    logging.info(f"Analysis request for: {file.filename}")
+    
+    try:
+        # Read PDF once and store bytes
+        pdf_bytes = file.read()
+        if not pdf_bytes:
+            return jsonify({"error": "Empty file"}), 400
+        
+        # Reset file pointer for potential re-read
+        file.seek(0)
+        
+        # Extract text
+        full_text = extract_text_from_pdf(pdf_bytes)
+        if not full_text or len(full_text.strip()) < 50:
+            return jsonify({"error": "Could not extract text from PDF"}), 400
+        
+        # Parse with Gemini
+        gemini_results = parse_text_with_gemini(full_text)
+        
+        # Extract dimensions
+        dimensions = extract_dimensions_from_text(full_text)
+        
+        # Extract coordinates
+        coordinates = extract_coordinates_from_text(full_text)
+        
+        # Calculate development length
+        dev_length = calculate_development_length(coordinates)
+        
+        # Material lookup
+        standard = gemini_results.get("standard", "Not Found")
+        grade = gemini_results.get("grade", "Not Found")
+        material = get_material_from_standard(standard, grade)
+        
+        # Prepare final results
+        final_results = {
+            "part_number": gemini_results.get("part_number", "Not Found"),
+            "description": gemini_results.get("description", "Not Found"),
+            "standard": standard,
+            "grade": grade,
+            "material": material,
+            "dimensions": dimensions,
+            "coordinates": coordinates,
+            "development_length": f"{dev_length:.2f}" if dev_length > 0 else "Not Found",
+            "validation_warnings": []
+        }
+        
+        # Add specific values from dimensions
+        for key in ['id1', 'centerline_length', 'weight']:
+            if dimensions.get(key) != "Not Found":
+                final_results[key] = dimensions[key]
+        
+        logging.info(f"Analysis completed for: {final_results.get('part_number', 'Unknown')}")
+        return jsonify(final_results)
+        
+    except Exception as e:
+        logging.error(f"Error analyzing PDF: {e}")
+        return jsonify({"error": f"Analysis failed: {str(e)}"}), 500
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+if __name__ == '__main__':
+    app.run(debug=True)
